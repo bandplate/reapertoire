@@ -74,8 +74,13 @@ class FakeIngest(BaseHTTPRequestHandler):
         if not self._authorised():
             return
         if self.path.endswith("/instruments"):
+            # `aliases` is only sent when a test sets it, so every other test
+            # still exercises a server that predates the field.
+            aliases = self.state.get("aliases")
             self._send(200, {"instruments": [
-                {"slug": slug, "label": slug.title()} for slug in self.state["vocabulary"]
+                {"slug": slug, "label": slug.title(),
+                 **({"aliases": aliases.get(slug, [])} if aliases is not None else {})}
+                for slug in self.state["vocabulary"]
             ]})
         elif "/uploads" in self.path:
             self.state["refreshes"] += 1
@@ -519,6 +524,25 @@ class TestErrorContext(ServerCase):
 
 
 class TestVocabulary(ServerCase):
+    def test_a_slug_kept_alive_as_an_alias_is_accepted(self):
+        # `gtr` is another name for `organ`. The server accepts it, so the
+        # client must too.
+        self.state["vocabulary"] = ["bass", "organ"]
+        self.state["aliases"] = {"organ": ["gtr"]}
+        upload_session(self.write_manifest(), self.client, log=lambda *_: None)
+        self.assertEqual(len(self.state["events"]), 1, "the session was declared")
+
+    def test_the_error_lists_aliases_as_accepted_names(self):
+        # An alias is another name for the instrument, so the list of what
+        # the mapping may use names it, beside the instrument it belongs to.
+        self.state["vocabulary"] = ["bass", "organ"]
+        self.state["aliases"] = {"organ": ["keys"]}
+        with self.assertRaises(IngestError) as caught:
+            upload_session(self.write_manifest(), self.client, log=lambda *_: None)
+        message = str(caught.exception)
+        self.assertIn("gtr", message)
+        self.assertIn("bass, organ (also: keys)", message)
+
     def test_a_server_with_no_vocabulary_stops_the_run(self):
         # An empty vocabulary is a hard stop, not nothing to check: ingest
         # cannot create instruments, so every take would earn its own 422.

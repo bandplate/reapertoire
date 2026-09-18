@@ -214,14 +214,25 @@ class Client:
     # ------------------------------------------------------------- operations
 
     def instruments(self):
-        """The live slug vocabulary: {"instruments": [{"slug", "label"}]}.
+        """The live vocabulary: {canonical slug: [its aliases]}.
 
-        Entries are read leniently -- a bare slug string is accepted too --
-        because only the slug is wanted here and the label is presentation.
+        An alias is another name for the instrument, accepted wherever the
+        canonical slug is. Checking against canonical slugs alone refused
+        names the server would have taken.
+
+        Entries are read leniently -- a bare slug string is accepted too, and
+        so is an entry with no `aliases`, which is every server from before
+        the field existed.
         """
         payload = self._json("GET", "/instruments")
         entries = payload if isinstance(payload, list) else payload.get("instruments", [])
-        return {i if isinstance(i, str) else i.get("slug") for i in entries}
+        vocabulary = {}
+        for entry in entries:
+            if isinstance(entry, str):
+                vocabulary[entry] = []
+            elif entry.get("slug"):
+                vocabulary[entry["slug"]] = [a for a in entry.get("aliases") or [] if a]
+        return vocabulary
 
     def declare_event(self, event):
         return self._json("POST", "/events", event)
@@ -553,6 +564,7 @@ def upload_session(manifest_path, client, publish=True, dry_run=False, log=print
     # entirely against a blank server and let every take earn its own 422.
     vocabulary = None if dry_run else client.instruments()
     if vocabulary is not None:
+        accepted = set(vocabulary).union(*vocabulary.values())
         # The server validates every slug an asset names, not just the take's
         # own instrument list -- a stem's, and a peaks asset's, which says
         # which source that waveform describes. Checking only the list let an
@@ -565,7 +577,7 @@ def upload_session(manifest_path, client, publish=True, dry_run=False, log=print
                if a.get("kind") in ("stem", "peaks")]
             if i
         }
-        unknown = sorted(used - vocabulary)
+        unknown = sorted(used - accepted)
         if unknown and not vocabulary:
             raise IngestError(
                 "the server has no instrument vocabulary yet, so none of these "
@@ -578,7 +590,10 @@ def upload_session(manifest_path, client, publish=True, dry_run=False, log=print
                 "these instrument slugs are not in the server's vocabulary: "
                 + ", ".join(unknown)
                 + "\nEdit the track mapping in config/settings.json to use: "
-                + ", ".join(sorted(vocabulary))
+                + ", ".join(
+                    f"{slug} (also: {', '.join(sorted(aliases))})" if aliases else slug
+                    for slug, aliases in sorted(vocabulary.items())
+                )
             )
 
     problems = []

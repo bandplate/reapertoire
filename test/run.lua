@@ -18,6 +18,7 @@ local SUITES = {
   "test.peaks_test",
   "test.peaks_test",
   "test.report_test",
+  "test.probes_test",
 }
 
 local passed, failed = 0, 0

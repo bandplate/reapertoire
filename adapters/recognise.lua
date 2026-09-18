@@ -6,6 +6,7 @@
 -- the DAW down with it. The two talk JSON over temporary files.
 
 local json = require("lib.util.json")
+local probes = require("lib.probes")
 local background = require("adapters.background")
 
 local M = {}
@@ -38,16 +39,45 @@ local function temp_dir()
   return os.getenv("TMPDIR") or "/tmp"
 end
 
--- Renders each region to a short, low-quality file purely for analysis. Chroma
--- and tempo need neither fidelity nor stereo, and a small file keeps the
--- extraction fast.
+-- Where probes are kept between openings of the naming panel.
 --
--- `rows` are { key, start, stop }. Returns { key = path }.
-function M.render_probes(render, rows, seconds, format)
-  local dir = string.format("%s/reapertoire-probe-%d", temp_dir(), os.time())
-  reaper.RecursiveCreateDirectory(dir, 0)
+-- `/tmp` itself, not `$TMPDIR`: on macOS `$TMPDIR` is a per-user directory
+-- under /var/folders that survives a reboot, while /tmp is emptied at every
+-- boot. Probes for regions deleted or re-tuned since therefore pile up only
+-- until the next restart, with no eviction to get wrong.
+M.PROBE_CACHE = "/tmp/reapertoire-probes"
 
-  local jobs, meta = {}, {}
+-- Renders a probe for each region that has no usable one cached, and returns
+-- paths for all of them.
+--
+-- `rows` are { key, guid, start, stop }. Returns
+--   paths      { key = path }, cached and fresh alike
+--   failures   list of reasons
+--   meta       { key = { duration, fileSeconds } }
+--   elapsed    seconds spent rendering
+--   info       { reused = n, disposable = { path, ... } }
+--
+-- `disposable` are probes that can never be reused -- regions REAPER reports
+-- no GUID for -- which the caller deletes once it has matched them.
+function M.render_probes(render, rows, seconds, format, cache_dir)
+  cache_dir = cache_dir or M.PROBE_CACHE
+  reaper.RecursiveCreateDirectory(cache_dir, 0)
+
+  -- Indexed by stem: REAPER appends whatever extension the format uses, so a
+  -- probe is found by its key, not by a name guessed in advance.
+  local cached, index = {}, 0
+  while true do
+    local name = reaper.EnumerateFiles(cache_dir, index)
+    if not name then break end
+    local stem = name:match("^(.*)%.[^.]+$")
+    if stem then cached[stem] = cache_dir .. "/" .. name end
+    index = index + 1
+  end
+
+  local paths, jobs, meta = {}, {}, {}
+  local info = { reused = 0, disposable = {} }
+  local fresh = {}   -- keys whose render leaves nothing worth keeping
+
   for _, row in ipairs(rows) do
     -- The whole region, not a slice of it. This is the single largest factor
     -- in whether the guess is right: measured over held-out takes, a
@@ -59,33 +89,37 @@ function M.render_probes(render, rows, seconds, format)
     local length = row.stop - row.start
     local window = math.min(seconds or 600, length)
     local from = row.start + math.max(0, (length - window) / 2)
-    jobs[#jobs + 1] = {
-      key = row.key, dir = dir, name = tostring(row.key),
-      start = from, stop = from + window,
-    }
     -- The take's own length, not the excerpt's: it is what the duration
     -- feature compares against the references.
     meta[row.key] = { duration = length, fileSeconds = window }
+
+    local key = probes.key(row.guid, from, from + window, format)
+    if key and cached[key] then
+      paths[row.key] = cached[key]
+      info.reused = info.reused + 1
+    else
+      -- A region with no GUID gets a one-off name: unique to this opening, so
+      -- REAPER never stops to ask about overwriting, and deleted after use
+      -- since nothing could ever find it again.
+      local name = key or string.format("once-%d-%s", os.time(), tostring(row.key))
+      if not key then fresh[row.key] = true end
+      jobs[#jobs + 1] = {
+        key = row.key, dir = cache_dir, name = name,
+        start = from, stop = from + window,
+      }
+    end
   end
 
   local started = reaper.time_precise()
-  local paths, failures = render.probe_batch(jobs, format)
-  local elapsed = reaper.time_precise() - started
-
-  return dir, paths, failures, meta, elapsed
-end
-
-function M.remove_probes(dir)
-  local index = 0
-  local files = {}
-  while true do
-    local name = reaper.EnumerateFiles(dir, index)
-    if not name then break end
-    files[#files + 1] = dir .. "/" .. name
-    index = index + 1
+  if #jobs > 0 then
+    local rendered, failures = render.probe_batch(jobs, format)
+    for k, path in pairs(rendered) do
+      paths[k] = path
+      if fresh[k] then info.disposable[#info.disposable + 1] = path end
+    end
+    return paths, failures, meta, reaper.time_precise() - started, info
   end
-  for _, path in ipairs(files) do os.remove(path) end
-  os.remove(dir)
+  return paths, {}, meta, 0, info
 end
 
 -- Ranks the reference library against each probe. Returns { key = { {song, score} } }.

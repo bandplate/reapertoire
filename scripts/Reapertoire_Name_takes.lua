@@ -194,7 +194,7 @@ local function run_recognition()
   local pending = {}
   for i, row in ipairs(view) do
     if not row.song then
-      pending[#pending + 1] = { key = i, start = row.start, stop = row.stop }
+      pending[#pending + 1] = { key = i, guid = row.guid, start = row.start, stop = row.stop }
     end
   end
   if #pending == 0 then
@@ -209,16 +209,18 @@ local function run_recognition()
     return
   end
 
-  -- 25 s is plenty for a chord distribution and a tempo, and the probe render
-  -- runs the whole FX chain, so every second counts.
-  local dir, paths, failures, meta, elapsed = recognise.render_probes(render, pending, 600,
-    cfg.recognition and cfg.recognition.probeFormat)
+  -- Whole takes, ceilinged at ten minutes; see `render_probes`. Cached in
+  -- /tmp between openings, so only takes whose region is new or re-tuned since
+  -- the last reboot pay for a render.
+  local paths, failures, meta, elapsed, probe_info = recognise.render_probes(
+    render, pending, 600, cfg.recognition and cfg.recognition.probeFormat)
 
   local rendered = 0
   for _ in pairs(paths) do rendered = rendered + 1 end
 
   local ranked, match_error = recognise.match(repo_dir, references, paths, meta)
-  recognise.remove_probes(dir)
+  -- Only probes nothing could ever find again; the rest stay for next time.
+  for _, path in ipairs(probe_info.disposable) do os.remove(path) end
 
   local guessed, filled = 0, 0
   local threshold = min_margin()
@@ -247,10 +249,19 @@ local function run_recognition()
       "Rendered %d probes, no match: %s", rendered,
       match_error or "the library returned no candidates")
   else
+    local fresh = rendered - probe_info.reused
+    local probes_note
+    if fresh == 0 then
+      probes_note = string.format("all %d probes reused", probe_info.reused)
+    elseif probe_info.reused == 0 then
+      probes_note = string.format("%.1fs to render probes", elapsed or 0)
+    else
+      probes_note = string.format("%d probes reused, %d rendered in %.1fs",
+        probe_info.reused, fresh, elapsed or 0)
+    end
     recognise_note = string.format(
       "Suggested songs for %d of %d unnamed takes, %d filled in automatically"
-      .. " (marked *, %.1fs to render probes)",
-      guessed, #pending, filled, elapsed or 0)
+      .. " (marked *, %s)", guessed, #pending, filled, probes_note)
   end
 end
 
